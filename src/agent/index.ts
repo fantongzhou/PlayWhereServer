@@ -68,6 +68,18 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
       // Agent 认为可以给出最终答案了——尝试解析 JSON
       const finalContent = responseMessage.content || '';
       const tripPlan = parsePlanFromText(finalContent, request);
+
+      // 如果解析出的是空行程且还没重试过，强制要求 LLM 重试输出纯 JSON
+      if (tripPlan.days.length === 0 && step < maxSteps - 1) {
+        emit({ type: 'thought', content: '⚠️ 未检测到有效的行程 JSON，正在重新生成...', step });
+        messages.push(responseMessage);
+        messages.push({
+          role: 'user',
+          content: '你刚才的输出中没有包含有效的 TripPlan JSON。请重新输出，**只输出纯 JSON 对象**，不要加任何前缀文字（如"好的"、"以下是"等），不要加任何后缀，不要用 markdown 代码块包裹。就是纯 JSON 字符串。',
+        });
+        continue; // 再给 LLM 一次机会
+      }
+
       emit({ type: 'plan_complete', plan: tripPlan, step });
       return tripPlan;
     }
@@ -255,6 +267,48 @@ async function runSimulated(request: TripRequest, emit: SSECallback): Promise<Tr
   return tripPlan;
 }
 
+// ---- JSON 提取（括号计数法，支持任意嵌套深度） ----
+function extractJSONBlocks(text: string): string[] {
+  const results: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === '\\') {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        results.push(text.substring(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return results;
+}
+
 // ---- 文本解析（降级使用） ----
 function parsePlanFromText(text: string, request: TripRequest): TripPlan {
   const candidates: string[] = [];
@@ -268,20 +322,22 @@ function parsePlanFromText(text: string, request: TripRequest): TripPlan {
     }
   }
 
-  // 策略2: 提取独立的 JSON 对象 {...}（找最后一个包含 city 和 days 的）
-  const jsonMatches = text.match(/\{[\s\S]*?"city"[\s\S]*?"days"[\s\S]*?\}/g);
-  if (jsonMatches) {
-    // 取最后一个匹配（通常是最终的完整 JSON）
-    candidates.push(jsonMatches[jsonMatches.length - 1]);
+  // 策略2: 括号计数法提取所有顶层 JSON 对象（支持任意嵌套深度）
+  const allBlocks = extractJSONBlocks(text);
+  // 从中筛选包含 "city" 和 "days" 的，优先取最后一个（通常是最终输出）
+  const validBlocks = allBlocks.filter(b => b.includes('"city"') && b.includes('"days"'));
+  if (validBlocks.length > 0) {
+    candidates.push(validBlocks[validBlocks.length - 1]);
   }
 
-  // 策略3: 提取任何 JSON 对象尝试
-  const anyJson = text.match(/\{(?:[^{}]|(?:\{[^{}]*\}))*\}/g);
-  if (anyJson) {
-    for (const match of anyJson.reverse()) {
-      if (match.includes('"city"') && match.includes('"days"')) {
-        candidates.push(match);
-      }
+  // 策略3: 兜底 — 如果括号计数没找到，尝试正则（简单嵌套场景）
+  if (candidates.length === 0) {
+    const looseMatch = text.match(/\{[\s\S]*"city"[\s\S]*"days"[\s\S]*\}/);
+    if (looseMatch) {
+      // 用括号计数法从匹配结果中精确截取
+      const blocks = extractJSONBlocks(looseMatch[0]);
+      if (blocks.length > 0) candidates.push(blocks[0]);
+      else candidates.push(looseMatch[0]);
     }
   }
 
