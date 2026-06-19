@@ -91,6 +91,8 @@ export interface Activity {
   type: 'attraction' | 'restaurant' | 'hotel';
   duration: string;
   note: string;
+  /** 购票/预订链接（美团返回） */
+  bookingUrl?: string;
 }
 
 export interface DayPlan {
@@ -98,7 +100,7 @@ export interface DayPlan {
   date: string;
   weather: WeatherInfo | null;
   activities: Activity[];
-  hotel: Hotel | null;
+  hotel: (Hotel & { bookingUrl?: string }) | null;
 }
 
 export interface TripPlan {

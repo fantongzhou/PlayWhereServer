@@ -1,13 +1,14 @@
 import OpenAI from 'openai';
 import { tools } from './tools.js';
 import { SYSTEM_PROMPT } from './prompt.js';
+import { getSessionMemory, type MemoryManager } from './memory.js';
 import type { TripRequest, SSEEvent, TripPlan } from '../types.js';
 
 // ---- SSE 回调类型 ----
 export type SSECallback = (event: SSEEvent) => void;
 
-// ---- LLM 模式 ----
-async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<TripPlan> {
+// ---- LLM 客户端工厂 ----
+function createLLMClient(): { client: OpenAI; model: string } {
   const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
   const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 
@@ -15,7 +16,15 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
     throw new Error('请设置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 环境变量');
   }
 
-  const client = new OpenAI({ apiKey, baseURL });
+  return {
+    client: new OpenAI({ apiKey, baseURL }),
+    model: process.env.LLM_MODEL || 'deepseek-chat',
+  };
+}
+
+// ---- LLM 模式 ----
+async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<TripPlan> {
+  const { client, model } = createLLMClient();
 
   emit({ type: 'start', message: `开始规划 ${request.city} ${request.days}日游...`, step: 0 });
 
@@ -36,7 +45,7 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
     step++;
 
     const completion = await client.chat.completions.create({
-      model: process.env.LLM_MODEL || 'deepseek-chat',
+      model,
       messages,
       tools: tools.map(t => ({
         type: 'function' as const,
@@ -248,16 +257,68 @@ async function runSimulated(request: TripRequest, emit: SSECallback): Promise<Tr
 
 // ---- 文本解析（降级使用） ----
 function parsePlanFromText(text: string, request: TripRequest): TripPlan {
-  // 尝试从文本中提取 JSON
-  const jsonMatch = text.match(/\{[\s\S]*"city"[\s\S]*"days"[\s\S]*\}/);
-  if (jsonMatch) {
-    try {
-      return JSON.parse(jsonMatch[0]);
-    } catch {
-      // fall through
+  const candidates: string[] = [];
+
+  // 策略1: 提取 ```json ... ``` 代码块中的 JSON
+  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/g);
+  if (codeBlockMatch) {
+    for (const block of codeBlockMatch) {
+      const inner = block.replace(/```(?:json)?\s*|\s*```/g, '').trim();
+      if (inner.startsWith('{')) candidates.push(inner);
     }
   }
-  // 降级：返回基本结构
+
+  // 策略2: 提取独立的 JSON 对象 {...}（找最后一个包含 city 和 days 的）
+  const jsonMatches = text.match(/\{[\s\S]*?"city"[\s\S]*?"days"[\s\S]*?\}/g);
+  if (jsonMatches) {
+    // 取最后一个匹配（通常是最终的完整 JSON）
+    candidates.push(jsonMatches[jsonMatches.length - 1]);
+  }
+
+  // 策略3: 提取任何 JSON 对象尝试
+  const anyJson = text.match(/\{(?:[^{}]|(?:\{[^{}]*\}))*\}/g);
+  if (anyJson) {
+    for (const match of anyJson.reverse()) {
+      if (match.includes('"city"') && match.includes('"days"')) {
+        candidates.push(match);
+      }
+    }
+  }
+
+  // 依次尝试解析每个候选
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed.city && Array.isArray(parsed.days)) {
+        // 补全可能缺失的字段
+        return {
+          city: parsed.city || request.city,
+          days: (parsed.days || []).map((d: any, i: number) => ({
+            day: d.day || i + 1,
+            date: d.date || new Date(Date.now() + i * 86400000).toISOString().split('T')[0],
+            weather: d.weather || null,
+            activities: (d.activities || []).map((a: any) => ({
+              time: a.time || '',
+              name: a.name || '',
+              lat: a.lat || 0,
+              lng: a.lng || 0,
+              type: a.type || 'attraction',
+              duration: a.duration || '1小时',
+              note: a.note || '',
+              bookingUrl: a.bookingUrl || undefined,
+            })),
+            hotel: d.hotel ? { ...d.hotel, bookingUrl: d.hotel.bookingUrl || undefined } : null,
+          })),
+          totalBudget: parsed.totalBudget || '请参考上方详细行程',
+          tips: parsed.tips || [],
+        };
+      }
+    } catch {
+      // 继续尝试下一个
+    }
+  }
+
+  // 最终降级
   return {
     city: request.city,
     days: [],
@@ -266,23 +327,29 @@ function parsePlanFromText(text: string, request: TripRequest): TripPlan {
   };
 }
 
-// ---- 自由对话模式（支持美团 Token 流程等） ----
-async function runChatWithLLM(userMessage: string, emit: SSECallback): Promise<string> {
-  const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
-  const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-
-  if (!apiKey) {
-    throw new Error('请设置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 环境变量');
-  }
-
-  const client = new OpenAI({ apiKey, baseURL });
+// ---- 自由对话模式（带记忆：滑动窗口 + 历史精炼） ----
+async function runChatWithMemory(
+  userMessage: string,
+  memory: MemoryManager,
+  emit: SSECallback,
+): Promise<string> {
+  const { client, model } = createLLMClient();
 
   emit({ type: 'start', message: '正在处理您的问题...', step: 0 });
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: userMessage },
-  ];
+  // Step 1: 添加用户消息到记忆
+  memory.addUserMessage(userMessage);
+
+  // Step 2: 检查是否需要压缩（在构建上下文之前）
+  if (memory.needsCompression()) {
+    emit({ type: 'thought', content: '🔄 正在精炼历史对话...', step: -1 });
+    const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || '';
+    const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
+    await memory.compress(apiKey, baseURL, model);
+  }
+
+  // Step 3: 构建上下文（system + summary + window messages）
+  const messages = memory.getContextMessages();
 
   let step = 0;
   const maxSteps = 15;
@@ -291,7 +358,7 @@ async function runChatWithLLM(userMessage: string, emit: SSECallback): Promise<s
     step++;
 
     const completion = await client.chat.completions.create({
-      model: process.env.LLM_MODEL || 'deepseek-chat',
+      model,
       messages,
       tools: tools.map(t => ({
         type: 'function' as const,
@@ -311,8 +378,19 @@ async function runChatWithLLM(userMessage: string, emit: SSECallback): Promise<s
     }
 
     if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-      // 对话完成
+      // 对话完成 — 将助手回复存入记忆
       const finalContent = responseMessage.content || '';
+      memory.addAssistantMessage(finalContent);
+
+      // 如果回复后消息超窗，异步压缩（不阻塞当前响应）
+      if (memory.needsCompression()) {
+        const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || '';
+        const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
+        memory.compress(apiKey, baseURL, model).catch(e =>
+          console.warn('⚠️  后台记忆压缩失败:', e),
+        );
+      }
+
       emit({ type: 'plan_complete', plan: { city: '', days: [], totalBudget: '', tips: [] }, step });
       return finalContent;
     }
@@ -364,17 +442,37 @@ export async function runAgent(request: TripRequest, emit: SSECallback): Promise
   return runSimulated(request, emit);
 }
 
-/** 自由对话入口（支持美团 Token 流程、旅游问答等） */
-export async function runChatAgent(message: string, emit: SSECallback): Promise<string> {
+/**
+ * 自由对话入口（带记忆）
+ * @param message  用户消息
+ * @param sessionId 会话 ID（同一会话保持记忆连续性）
+ * @param emit     SSE 回调
+ */
+export async function runChatAgent(
+  message: string,
+  sessionId: string,
+  emit: SSECallback,
+): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
 
   if (apiKey) {
-    return runChatWithLLM(message, emit);
+    const memory = getSessionMemory(sessionId);
+    return runChatWithMemory(message, memory, emit);
   }
 
   // 模拟模式下的对话：简单回显
   emit({ type: 'start', message: '(模拟模式) 处理您的问题...', step: 0 });
-  emit({ type: 'thought', content: `收到您的消息：${message}。当前为模拟模式，请配置 LLM API Key 以获得完整功能。`, step: 1 });
+  emit({
+    type: 'thought',
+    content: `收到您的消息：${message}。当前为模拟模式，请配置 LLM API Key 以获得完整功能。`,
+    step: 1,
+  });
   emit({ type: 'plan_complete', plan: { city: '', days: [], totalBudget: '', tips: [] }, step: 1 });
   return '模拟模式回复';
+}
+
+/** 清除指定 session 的记忆 */
+export function clearSessionMemory(sessionId: string): void {
+  const memory = getSessionMemory(sessionId);
+  memory.clear();
 }

@@ -8,6 +8,7 @@ import {
   searchMeituanTravel,
   saveToken,
   getTokenStatus,
+  syncTokenToCLIConfig,
 } from '../services/meituan-travel.js';
 
 export interface ToolDefinition {
@@ -114,7 +115,7 @@ export const tools: ToolDefinition[] = [
   // ============================================================
   {
     name: 'check_meituan_token',
-    description: '检查美团旅行 API Token 是否已配置。返回 Token 状态。',
+    description: '检查美团旅行 API Token 是否已配置。Token 优先从环境变量 MEITUAN_API_TOKEN 读取，其次从 CLI 配置文件读取。',
     parameters: {
       type: 'object',
       properties: {},
@@ -124,35 +125,53 @@ export const tools: ToolDefinition[] = [
       const status = getTokenStatus();
       return {
         configured: status.hasKey,
+        source: status.source,
         message: status.hasKey
-          ? '✅ Token 已配置，可以直接使用美团旅行服务。'
-          : '❌ Token 未配置，需要用户前往美团开发者中心创建 Token。',
+          ? `✅ Token 已配置（来源：${status.source === 'env' ? '环境变量 MEITUAN_API_TOKEN' : 'CLI 配置文件'}），可以直接使用美团旅行服务。`
+          : '❌ Token 未配置，请在服务器 .env 中设置 MEITUAN_API_TOKEN。',
       };
     },
   },
   {
     name: 'save_meituan_token',
-    description: '保存用户提供的美团旅行 API Token。参数: token(用户提供的Token字符串)。调用后 Token 会被安全存储到本地配置。',
+    description: `配置/修复美团旅行 API Token。
+- 如果提供了 token 参数 → 保存到 CLI 配置文件（~/.config/meituan-travel/config.json）
+- 如果未提供 token → 从环境变量 MEITUAN_API_TOKEN 读取并同步到 CLI 配置文件
+- 当 CLI 找不到 Token 时使用此工具从环境变量恢复配置`,
     parameters: {
       type: 'object',
       properties: {
-        token: { type: 'string', description: '用户提供的美团 API Token 字符串' },
+        token: { type: 'string', description: '可选：用户提供的 Token 字符串。不填则从环境变量 MEITUAN_API_TOKEN 同步' },
       },
-      required: ['token'],
+      required: [],
     },
     execute: async (args) => {
       try {
-        saveToken(args.token);
-        return { success: true, message: '✅ Token 已保存，正在为您查询…' };
+        if (args.token) {
+          // 用户提供了 token → 保存到 CLI 配置
+          saveToken(args.token);
+          return { success: true, message: '✅ Token 已保存到 CLI 配置文件。' };
+        } else {
+          // 未提供 token → 从环境变量同步
+          const envToken = process.env.MEITUAN_API_TOKEN;
+          if (!envToken || envToken.trim().length === 0) {
+            return {
+              success: false,
+              message: '⚠️ 环境变量 MEITUAN_API_TOKEN 未设置或为空，请在服务器 .env 中配置。',
+            };
+          }
+          syncTokenToCLIConfig();
+          return { success: true, message: '✅ 已将环境变量 MEITUAN_API_TOKEN 同步到 CLI 配置文件。' };
+        }
       } catch (e: any) {
-        return { success: false, message: `Token 保存失败：${e.message}` };
+        return { success: false, message: `Token 配置失败：${e.message}` };
       }
     },
   },
   {
     name: 'search_meituan_travel',
     description: `使用美团旅行服务搜索酒店、景点门票、机票火车票、度假产品等。
-调用前必须先通过 check_meituan_token 确认 Token 已配置。
+Token 已在服务器环境变量中配置，无需额外检查。
 参数:
 - city: 城市名称（必填），如"北京"、"上海"、"三亚"
 - query: 详细的查询需求（必填），越具体推荐越精准。
