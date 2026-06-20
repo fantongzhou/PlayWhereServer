@@ -30,6 +30,7 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
 
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: 'MODE=planner OUTPUT=json' },
     {
       role: 'user',
       content: `请帮我规划一次${request.city}${request.days}日游。${
@@ -75,7 +76,7 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
         messages.push(responseMessage);
         messages.push({
           role: 'user',
-          content: '你刚才的输出中没有包含有效的 TripPlan JSON。请重新输出，**只输出纯 JSON 对象**，不要加任何前缀文字（如"好的"、"以下是"等），不要加任何后缀，不要用 markdown 代码块包裹。就是纯 JSON 字符串。',
+          content: '⚠️ MODE=planner 要求纯 JSON 输出。不要任何前缀/后缀/markdown，直接输出 JSON 字符串。',
         });
         continue; // 再给 LLM 一次机会
       }
@@ -362,6 +363,7 @@ function parsePlanFromText(text: string, request: TripRequest): TripPlan {
               duration: a.duration || '1小时',
               note: a.note || '',
               bookingUrl: a.bookingUrl || undefined,
+              imageUrls: Array.isArray(a.imageUrls) ? a.imageUrls : undefined,
             })),
             hotel: d.hotel ? { ...d.hotel, bookingUrl: d.hotel.bookingUrl || undefined } : null,
           })),
@@ -434,8 +436,22 @@ async function runChatWithMemory(
     }
 
     if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-      // 对话完成 — 将助手回复存入记忆
+      // 对话完成
       const finalContent = responseMessage.content || '';
+
+      // Chat 模式兜底：如果 LLM 错误地输出了 JSON，要求重试
+      const looksLikeJSON = finalContent.trim().startsWith('{') && finalContent.includes('"city"');
+      if (looksLikeJSON && step < maxSteps - 1) {
+        emit({ type: 'thought', content: '⚠️ Chat 模式不应输出 JSON，正在转换为可读格式...', step });
+        messages.push(responseMessage);
+        messages.push({
+          role: 'user',
+          content: '⚠️ MODE=chat 禁止输出 JSON。请用 markdown 格式重新输出：图片用 ![](url)、链接用 [文字](url)、评分加粗、价格原样。',
+        });
+        continue;
+      }
+
+      // 将助手回复存入记忆
       memory.addAssistantMessage(finalContent);
 
       // 如果回复后消息超窗，异步压缩（不阻塞当前响应）

@@ -62,6 +62,7 @@ export class MemoryManager {
   getContextMessages(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       { role: 'system', content: this.systemPrompt },
+      { role: 'system', content: 'MODE=chat OUTPUT=markdown' },
     ];
 
     // 注入历史摘要
