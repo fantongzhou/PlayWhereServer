@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import { tools } from './tools.js';
-import { SYSTEM_PROMPT } from './prompt.js';
+import { SYSTEM_PROMPT, getCurrentDateContext } from './prompt.js';
 import { getSessionMemory, type MemoryManager } from './memory.js';
 import type { TripRequest, SSEEvent, TripPlan } from '../types.js';
 
@@ -30,6 +30,7 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
 
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: getCurrentDateContext() },
     { role: 'system', content: 'MODE=planner OUTPUT=json' },
     {
       role: 'user',
@@ -145,21 +146,26 @@ async function runSimulated(request: TripRequest, emit: SSECallback): Promise<Tr
   const restaurants = await tools[5].execute({ city: request.city, preferences: request.preferences });
   emit({ type: 'observation', data: restaurants.slice(0, 4), step: 3 });
 
-  // Step 4: 逐天生成天气 + 构建行程
-  emit({ type: 'thought', content: '正在根据距离优化景点顺序，查询每日天气...', step: 4 });
+  // Step 4: 一次性批量查询所有日期天气 + 构建行程
+  emit({ type: 'thought', content: '正在根据距离优化景点顺序，一次性查询每日天气...', step: 4 });
 
   const today = new Date();
-  const days: TripPlan['days'] = [];
-
+  const dateStrs: string[] = [];
   for (let d = 0; d < request.days; d++) {
     const date = new Date(today);
     date.setDate(date.getDate() + d + 1);
-    const dateStr = date.toISOString().split('T')[0];
+    dateStrs.push(date.toISOString().split('T')[0]);
+  }
 
-    emit({ type: 'action', tool: 'get_weather', args: { city: request.city, date: dateStr }, step: 4 });
+  emit({ type: 'action', tool: 'get_weather', args: { city: request.city, dates: dateStrs }, step: 4 });
+  const weathers = await tools[3].execute({ city: request.city, dates: dateStrs });
+  emit({ type: 'observation', data: weathers, step: 4 });
 
-    const weather = await tools[3].execute({ city: request.city, date: dateStr });
-    emit({ type: 'observation', data: weather, step: 4 });
+  const days: TripPlan['days'] = [];
+
+  for (let d = 0; d < request.days; d++) {
+    const dateStr = dateStrs[d];
+    const weather = weathers[d];
 
     // 分配景点（每天 3-4 个，轮询分配）
     const dayAttractions = attractions.slice(d * 3, d * 3 + 3);
@@ -257,8 +263,8 @@ async function runSimulated(request: TripRequest, emit: SSECallback): Promise<Tr
     totalBudget: `机票约2000-3000元 + 酒店约${estimatedHotelCost}元 + 餐饮及门票约3000元 = 总计约${estimatedHotelCost + 5000}元`,
     tips: [
       `建议购买${request.city}公交一日券，省钱又方便`,
-      '大部分寺庙和神社免费参观，部分需要购买门票（约500日元）',
-      '日本靠左行驶，注意交通安全',
+      '大部分公园和博物馆免费或低价，热门景点建议提前在美团预约门票',
+      '国内靠右行驶，注意交通安全；热门景区尽量早出晚归避开人流',
       '携带现金，有些小店不支持信用卡',
       `根据天气情况：${days[0]?.weather?.suggestion || '注意防晒或保暖'}`,
     ],

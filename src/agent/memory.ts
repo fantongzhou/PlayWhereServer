@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { SYSTEM_PROMPT } from './prompt.js';
+import { SYSTEM_PROMPT, getCurrentDateContext } from './prompt.js';
 
 // ============================================================
 // 记忆模块 — 滑动窗口 + 历史会话精炼
@@ -62,6 +62,7 @@ export class MemoryManager {
   getContextMessages(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       { role: 'system', content: this.systemPrompt },
+      { role: 'system', content: getCurrentDateContext() },
       { role: 'system', content: 'MODE=chat OUTPUT=markdown' },
     ];
 

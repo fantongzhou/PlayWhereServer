@@ -1,7 +1,7 @@
 import { searchAttractions } from '../services/attractions.js';
 import { searchHotels } from '../services/hotels.js';
 import { searchFlights as getFlights } from '../services/flights.js';
-import { getWeather } from '../services/weather.js';
+import { getWeatherBatch } from '../services/weather.js';
 import { getRoute } from '../services/routes.js';
 import { searchRestaurants } from '../services/restaurants.js';
 import {
@@ -25,7 +25,7 @@ export const tools: ToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: {
-        city: { type: 'string', description: '城市名称，如"京都"、"东京"、"大阪"' },
+        city: { type: 'string', description: '城市名称，如"北京"、"上海"、"三亚"' },
         preferences: {
           type: 'array',
           items: { type: 'string' },
@@ -64,16 +64,28 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'get_weather',
-    description: '获取指定城市某天的天气。参数: city(城市名), date(日期，格式YYYY-MM-DD)',
+    description: '获取指定城市一个或多个日期的天气。参数: city(城市名), dates(日期数组，格式YYYY-MM-DD，如["2026-06-20","2026-06-21"])。返回天气信息数组。',
     parameters: {
       type: 'object',
       properties: {
         city: { type: 'string', description: '城市名称' },
-        date: { type: 'string', description: '日期，格式YYYY-MM-DD' },
+        dates: {
+          type: 'array',
+          items: { type: 'string', description: '日期，格式 YYYY-MM-DD' },
+          description: '要查询的日期数组，支持一次性查询多天',
+        },
       },
-      required: ['city', 'date'],
+      required: ['city', 'dates'],
     },
-    execute: async (args) => getWeather(args.city, args.date),
+    execute: async (args) => {
+      // 兼容旧的单日期 date 参数
+      const dates: string[] = Array.isArray(args.dates)
+        ? args.dates
+        : args.date
+          ? [args.date]
+          : [];
+      return getWeatherBatch(args.city, dates);
+    },
   },
   {
     name: 'get_route',
