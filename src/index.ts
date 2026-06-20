@@ -16,7 +16,7 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), apiKey: process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY });
 });
 
 app.use('/api/plan', planRouter);
