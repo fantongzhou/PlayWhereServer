@@ -62,15 +62,16 @@ export interface Restaurant {
 }
 
 // ---- SSE 事件类型 ----
+// Lifecycle:  start → (thought | status | action | observation)* → complete | error
 export type SSEEventType =
-  | 'start'
-  | 'thought'
-  | 'response'
-  | 'action'
-  | 'observation'
-  | 'plan_partial'
-  | 'plan_complete'
-  | 'error';
+  | 'start'        // 规划开始
+  | 'thought'      // LLM 流式推理 token
+  | 'status'       // 系统状态/进度提示（如重试、逐天生成）
+  | 'action'       // 工具调用
+  | 'observation'  // 工具返回
+  | 'response'     // 最终自然语言回复
+  | 'complete'     // 行程规划完成（含结构化 TripPlan）
+  | 'error';       // 错误（来自 route 层 catch）
 
 export interface SSEEvent {
   type: SSEEventType;

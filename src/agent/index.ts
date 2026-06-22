@@ -28,7 +28,7 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
 
   if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
 
-  emit({ type: 'start', message: '开始分析您的旅行需求...', step: 0 });
+  emit({ type: 'start', message: '正在为您定制旅行计划...', step: 0 });
 
   // 将用户消息加入记忆
   memory.addUserMessage(message);
@@ -116,13 +116,13 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
         const questionPlan: TripPlan = {
           city: '', days: [], totalBudget: '', tips: [finalContent.trim()],
         };
-        emit({ type: 'plan_complete', plan: questionPlan, step });
+        emit({ type: 'complete', plan: questionPlan, step });
         return questionPlan;
       }
 
       // 空行程且未重试 → 要求 LLM 重新输出
       if (tripPlan.days.length === 0 && step < maxSteps - 1) {
-        emit({ type: 'thought', content: '⚠️ 未检测到有效的行程 JSON，正在重新生成...', step });
+        emit({ type: 'status', content: '⚠️ 未检测到有效的行程 JSON，正在重新生成...', step });
         messages.push({ role: 'assistant', content: finalContent });
         messages.push({ role: 'user', content: RETRY_HINT });
         continue;
@@ -132,7 +132,7 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
       // response 只发自然语言部分，去掉 JSON 代码块
       const naturalContent = finalContent.replace(/```json[\s\S]*?```/g, '').replace(/\{[\s\S]*"city"[\s\S]*"days"[\s\S]*\}/g, '').trim();
       emit({ type: 'response', content: naturalContent || '已为您生成行程，请查看右侧面板 👉', step });
-      emit({ type: 'plan_complete', plan: tripPlan, step });
+      emit({ type: 'complete', plan: tripPlan, step });
       return tripPlan;
     }
 
@@ -185,72 +185,6 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
   throw new Error('Agent 超过最大步骤数');
 }
 
-// ---- 模拟模式（无需 API Key） ----
-async function runSimulated(message: string, emit: SSECallback): Promise<TripPlan> {
-  emit({ type: 'start', message: '(模拟模式) 开始分析您的旅行需求...', step: 0 });
-
-  // 从消息中简单提取城市名
-  const cityMatch = message.match(/北京|上海|三亚|成都|西安|杭州|广州|深圳|重庆|南京|武汉|长沙|厦门|青岛|大连|昆明/);
-  const city = cityMatch ? cityMatch[0] : '未知城市';
-
-  // 提取天数
-  const daysMatch = message.match(/(\d+)\s*天/);
-  const days = daysMatch ? parseInt(daysMatch[1], 10) : 3;
-
-  emit({ type: 'thought', content: `(模拟模式) 识别到目的地: ${city}，${days}天`, step: 1 });
-
-  const today = new Date();
-  const dateStrs: string[] = [];
-  for (let d = 0; d < days; d++) {
-    const date = new Date(today);
-    date.setDate(date.getDate() + d + 1);
-    dateStrs.push(date.toISOString().split('T')[0]);
-  }
-
-  // 尝试获取天气
-  let weathers: any[] = [];
-  try {
-    const weatherTool = tools.find(t => t.name === 'get_weather');
-    if (weatherTool) {
-      emit({ type: 'action', tool: 'get_weather', args: { city, dates: dateStrs }, step: 2 });
-      weathers = await weatherTool.execute({ city, dates: dateStrs });
-      emit({ type: 'observation', data: weathers, step: 2 });
-    }
-  } catch {
-    // weather tool failed, continue without it
-  }
-
-  const planDays: TripPlan['days'] = [];
-  for (let d = 0; d < days; d++) {
-    planDays.push({
-      day: d + 1,
-      date: dateStrs[d],
-      weather: weathers[d] || null,
-      activities: [
-        {
-          time: '09:00',
-          name: `第${d + 1}天景点`,
-          lat: 0, lng: 0,
-          type: 'attraction',
-          duration: '3小时',
-          note: '请配置 LLM API Key 获取真实行程',
-        },
-      ],
-      hotel: null,
-    });
-    emit({ type: 'plan_partial', data: { day: d + 1, date: dateStrs[d], count: 1 }, step: 3 });
-  }
-
-  const tripPlan: TripPlan = {
-    city,
-    days: planDays,
-    totalBudget: '模拟模式 — 请配置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 获取真实行程',
-    tips: ['当前为模拟模式，请设置环境变量 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 启用 AI 规划'],
-  };
-
-  emit({ type: 'plan_complete', plan: tripPlan, step: 4 });
-  return tripPlan;
-}
 
 // ---- JSON 提取（括号计数法，支持任意嵌套深度） ----
 function extractJSONBlocks(text: string): string[] {
@@ -373,13 +307,12 @@ function parsePlanFromText(text: string): TripPlan {
 export async function runAgent(message: string, sessionId: string, emit: SSECallback, isAborted: () => boolean): Promise<TripPlan> {
   const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
 
-  if (apiKey) {
-    const memory = getSessionMemory(sessionId);
-    return runWithLLM(message, memory, emit, isAborted);
+  if (!apiKey) {
+    throw new Error('请设置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 环境变量');
   }
 
-  console.log('⚠️  未设置 API Key，使用模拟模式运行');
-  return runSimulated(message, emit);
+  const memory = getSessionMemory(sessionId);
+  return runWithLLM(message, memory, emit, isAborted);
 }
 
 /** 清除指定 session 的记忆 */

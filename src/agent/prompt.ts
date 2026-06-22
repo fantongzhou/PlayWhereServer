@@ -55,8 +55,8 @@ const TRIP_PLAN_SCHEMA = `\`\`\`
       "type": "attraction",            // attraction | restaurant | hotel
       "duration": "2小时",
       "note": "一句话说明 · 评分/价格/特色",
-      "bookingUrl": "https://www.meituan.com/...",   // 美团链接，没有则 ""
-      "imageUrls": ["https://img.meituan.net/a.jpg", "https://img.meituan.net/b.jpg"]  // 全部图片，没有则 []
+      "bookingUrl": "https://www.meituan.com/...",   // 美团链接，没有则 "" ，不要自己编造！
+      "imageUrls": ["https://img.meituan.net/a.jpg", "https://img.meituan.net/b.jpg"]  // 全部图片，没有则 []，不要自己编造！
     }],
     "hotel": { "name": "酒店名", "lat": 39.915, "lng": 116.413, "pricePerNight": 600, "bookingUrl": "https://hotel.meituan.com/..." }
   }],
@@ -117,7 +117,7 @@ const SYSTEM_RULES = `## 目标
 ### 强制规则
 1. 输出格式：**先输出自然语言总结（严禁 JSON），再输出 TripPlan JSON 代码块**。只输出纯 JSON（不含自然语言）仅在信息不足追问时允许
 2. 自然语言部分禁止携带任何 JSON 结构、花括号、代码块——这是给用户看的
-3. 名称、价格、评分、坐标、图片、链接一律用美团真实数据，详情/购票/预订链接填入 bookingUrl；景点的全部图片 URL 填入 imageUrls，禁止只留一张或丢弃
+3. 名称、价格、评分、坐标、图片、链接一律用美团真实数据，详情/购票/预订链接填入 bookingUrl；景点的全部图片 URL 填入 imageUrls，禁止只留一张或丢弃，没有链接不要自己编造
 
 ### TripPlan 结构（唯一权威 schema）
 ${TRIP_PLAN_SCHEMA}
