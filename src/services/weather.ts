@@ -11,15 +11,7 @@ import type { WeatherInfo } from '../types.js';
 const AMAP_KEY = process.env.AMAP_API_KEY;
 const AMAP_WEATHER_URL = 'https://restapi.amap.com/v3/weather/weatherInfo';
 
-/** 城市 → adcode 映射（高德天气接口需要城市编码） */
-const CITY_ADCODE: Record<string, string> = {
-  '北京': '110000',
-  '上海': '310000',
-  '三亚': '460200',
-  '成都': '510100',
-  '西安': '610100',
-  '杭州': '330100',
-};
+/** 城市 adcode 由 agent 自主搜索获取，不再硬编码映射。高德天气 API 同时支持中文城市名和 adcode。 */
 
 /** 天气现象（汉字）→ 出行建议；用关键字匹配以兼容「小雨转中雨」等组合 */
 function getSuggestion(condition: string): string {
@@ -79,8 +71,8 @@ async function fetchAmapForecast(city: string): Promise<Map<string, { condition:
   const result = new Map<string, { condition: string; low: number; high: number }>();
   if (!AMAP_KEY) return result;
 
-  const adcode = CITY_ADCODE[city] || city;
-  const url = `${AMAP_WEATHER_URL}?key=${AMAP_KEY}&city=${encodeURIComponent(adcode)}&extensions=all&output=JSON`;
+  // 高德天气 API 支持中文城市名，也可接受 adcode。Agent 可自行搜索 adcode 作为 city 参数传入。
+  const url = `${AMAP_WEATHER_URL}?key=${AMAP_KEY}&city=${encodeURIComponent(city)}&extensions=all&output=JSON`;
 
   try {
     const res = await fetch(url);

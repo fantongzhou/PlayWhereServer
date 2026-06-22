@@ -1,8 +1,8 @@
 import OpenAI from 'openai';
 import { tools } from './tools.js';
-import { SYSTEM_PROMPT, getCurrentDateContext } from './prompt.js';
+import { RETRY_HINT } from './prompt.js';
 import { getSessionMemory, type MemoryManager } from './memory.js';
-import type { TripRequest, SSEEvent, TripPlan } from '../types.js';
+import type { SSEEvent, TripPlan } from '../types.js';
 
 // ---- SSE 回调类型 ----
 export type SSECallback = (event: SSEEvent) => void;
@@ -23,30 +23,35 @@ function createLLMClient(): { client: OpenAI; model: string } {
 }
 
 // ---- LLM 模式 ----
-async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<TripPlan> {
+async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallback, isAborted: () => boolean): Promise<TripPlan> {
   const { client, model } = createLLMClient();
 
-  emit({ type: 'start', message: `开始规划 ${request.city} ${request.days}日游...`, step: 0 });
+  if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'system', content: getCurrentDateContext() },
-    { role: 'system', content: 'MODE=planner OUTPUT=json' },
-    {
-      role: 'user',
-      content: `请帮我规划一次${request.city}${request.days}日游。${
-        request.preferences.length > 0 ? `偏好：${request.preferences.join('、')}。` : ''
-      }预算等级：${request.budget}。请先查询相关信息，然后给出完整的行程计划。`,
-    },
-  ];
+  emit({ type: 'start', message: '开始分析您的旅行需求...', step: 0 });
+
+  // 将用户消息加入记忆
+  memory.addUserMessage(message);
+
+  // 检查是否需要压缩历史
+  if (memory.needsCompression()) {
+    const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || '';
+    const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
+    memory.compress(apiKey, baseURL, model).catch(e => console.warn('⚠️ 后台记忆压缩失败:', e));
+  }
+
+  // 从记忆构建上下文
+  const messages = memory.getContextMessages();
 
   let step = 0;
   const maxSteps = 15;
 
   while (step < maxSteps) {
+    if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
     step++;
 
-    const completion = await client.chat.completions.create({
+    // ---- 流式调用 LLM ----
+    const stream = await client.chat.completions.create({
       model,
       messages,
       tools: tools.map(t => ({
@@ -58,40 +63,96 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
         },
       })),
       tool_choice: 'auto',
+      stream: true,
     });
 
-    const responseMessage = completion.choices[0].message;
+    // 累积流式响应
+    let contentAcc = '';
+    const toolCallAcc: Map<number, { id: string; name: string; args: string }> = new Map();
 
-    if (responseMessage.content) {
-      emit({ type: 'thought', content: responseMessage.content, step });
-    }
+    for await (const chunk of stream) {
+      if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
+      const delta = chunk.choices[0]?.delta;
+      if (!delta) continue;
 
-    if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-      // Agent 认为可以给出最终答案了——尝试解析 JSON
-      const finalContent = responseMessage.content || '';
-      const tripPlan = parsePlanFromText(finalContent, request);
-
-      // 如果解析出的是空行程且还没重试过，强制要求 LLM 重试输出纯 JSON
-      if (tripPlan.days.length === 0 && step < maxSteps - 1) {
-        emit({ type: 'thought', content: '⚠️ 未检测到有效的行程 JSON，正在重新生成...', step });
-        messages.push(responseMessage);
-        messages.push({
-          role: 'user',
-          content: '⚠️ MODE=planner 要求纯 JSON 输出。不要任何前缀/后缀/markdown，直接输出 JSON 字符串。',
-        });
-        continue; // 再给 LLM 一次机会
+      // 流式内容 → 逐 token 推送
+      if (delta.content) {
+        contentAcc += delta.content;
+        emit({ type: 'thought', content: delta.content, step });
       }
 
+      // 流式 tool calls → 累积
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index;
+          if (!toolCallAcc.has(idx)) {
+            toolCallAcc.set(idx, { id: tc.id || '', name: tc.function?.name || '', args: '' });
+          }
+          const acc = toolCallAcc.get(idx)!;
+          if (tc.id) acc.id = tc.id;
+          if (tc.function?.name) acc.name = tc.function.name;
+          if (tc.function?.arguments) acc.args += tc.function.arguments;
+        }
+      }
+    }
+
+    // 流结束 — 判断是 tool calls 还是最终答案
+    const hasToolCalls = toolCallAcc.size > 0;
+
+    if (!hasToolCalls) {
+      // 最终答案 — 解析 JSON
+      const finalContent = contentAcc;
+      const tripPlan = parsePlanFromText(finalContent);
+
+      // 检测是否是自然语言追问
+      const isPlainTextQuestion = !finalContent.trim().startsWith('{')
+        && finalContent.length < 500
+        && /[？?]|请问|什么|哪个|几天|哪座|何时/.test(finalContent);
+
+      if (isPlainTextQuestion) {
+        memory.addAssistantMessage(finalContent);
+        emit({ type: 'response', content: finalContent, step });
+        const questionPlan: TripPlan = {
+          city: '', days: [], totalBudget: '', tips: [finalContent.trim()],
+        };
+        emit({ type: 'plan_complete', plan: questionPlan, step });
+        return questionPlan;
+      }
+
+      // 空行程且未重试 → 要求 LLM 重新输出
+      if (tripPlan.days.length === 0 && step < maxSteps - 1) {
+        emit({ type: 'thought', content: '⚠️ 未检测到有效的行程 JSON，正在重新生成...', step });
+        messages.push({ role: 'assistant', content: finalContent });
+        messages.push({ role: 'user', content: RETRY_HINT });
+        continue;
+      }
+
+      memory.addAssistantMessage(finalContent);
+      emit({ type: 'response', content: finalContent, step });
       emit({ type: 'plan_complete', plan: tripPlan, step });
       return tripPlan;
     }
 
-    // 处理 tool calls
-    messages.push(responseMessage);
+    // 处理 tool calls — 构建 assistant message 并执行工具
+    const streamedToolCalls = Array.from(toolCallAcc.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([_, tc]) => ({
+        id: tc.id,
+        type: 'function' as const,
+        function: { name: tc.name, arguments: tc.args },
+      }));
 
-    for (const toolCall of responseMessage.tool_calls) {
+    messages.push({ role: 'assistant', content: contentAcc || null, tool_calls: streamedToolCalls });
+
+    for (const toolCall of streamedToolCalls) {
+      if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
       const toolName = toolCall.function.name;
-      const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+      let toolArgs: any;
+      try {
+        toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+      } catch {
+        toolArgs = {};
+      }
 
       emit({ type: 'action', tool: toolName, args: toolArgs, step });
 
@@ -122,155 +183,69 @@ async function runWithLLM(request: TripRequest, emit: SSECallback): Promise<Trip
 }
 
 // ---- 模拟模式（无需 API Key） ----
-async function runSimulated(request: TripRequest, emit: SSECallback): Promise<TripPlan> {
-  emit({ type: 'start', message: `(模拟模式) 开始规划 ${request.city} ${request.days}日游...`, step: 0 });
+async function runSimulated(message: string, emit: SSECallback): Promise<TripPlan> {
+  emit({ type: 'start', message: '(模拟模式) 开始分析您的旅行需求...', step: 0 });
 
-  // Step 1: 获取景点
-  emit({ type: 'thought', content: `正在查询${request.city}的旅游景点...`, step: 1 });
-  emit({ type: 'action', tool: 'search_attractions', args: { city: request.city, preferences: request.preferences }, step: 1 });
+  // 从消息中简单提取城市名
+  const cityMatch = message.match(/北京|上海|三亚|成都|西安|杭州|广州|深圳|重庆|南京|武汉|长沙|厦门|青岛|大连|昆明/);
+  const city = cityMatch ? cityMatch[0] : '未知城市';
 
-  const attractions = await tools[0].execute({ city: request.city, preferences: request.preferences });
-  emit({ type: 'observation', data: attractions.slice(0, 5), step: 1 });
+  // 提取天数
+  const daysMatch = message.match(/(\d+)\s*天/);
+  const days = daysMatch ? parseInt(daysMatch[1], 10) : 3;
 
-  // Step 2: 获取酒店
-  emit({ type: 'thought', content: '正在查询酒店信息...', step: 2 });
-  emit({ type: 'action', tool: 'search_hotels', args: { city: request.city, budget: request.budget }, step: 2 });
-
-  const hotels = await tools[1].execute({ city: request.city, budget: request.budget });
-  emit({ type: 'observation', data: hotels, step: 2 });
-
-  // Step 3: 获取餐厅
-  emit({ type: 'thought', content: '正在搜索当地美食...', step: 3 });
-  emit({ type: 'action', tool: 'search_restaurants', args: { city: request.city, preferences: request.preferences }, step: 3 });
-
-  const restaurants = await tools[5].execute({ city: request.city, preferences: request.preferences });
-  emit({ type: 'observation', data: restaurants.slice(0, 4), step: 3 });
-
-  // Step 4: 一次性批量查询所有日期天气 + 构建行程
-  emit({ type: 'thought', content: '正在根据距离优化景点顺序，一次性查询每日天气...', step: 4 });
+  emit({ type: 'thought', content: `(模拟模式) 识别到目的地: ${city}，${days}天`, step: 1 });
 
   const today = new Date();
   const dateStrs: string[] = [];
-  for (let d = 0; d < request.days; d++) {
+  for (let d = 0; d < days; d++) {
     const date = new Date(today);
     date.setDate(date.getDate() + d + 1);
     dateStrs.push(date.toISOString().split('T')[0]);
   }
 
-  emit({ type: 'action', tool: 'get_weather', args: { city: request.city, dates: dateStrs }, step: 4 });
-  const weathers = await tools[3].execute({ city: request.city, dates: dateStrs });
-  emit({ type: 'observation', data: weathers, step: 4 });
-
-  const days: TripPlan['days'] = [];
-
-  for (let d = 0; d < request.days; d++) {
-    const dateStr = dateStrs[d];
-    const weather = weathers[d];
-
-    // 分配景点（每天 3-4 个，轮询分配）
-    const dayAttractions = attractions.slice(d * 3, d * 3 + 3);
-    const dayRestaurant = restaurants[d % restaurants.length];
-
-    const activities: TripPlan['days'][0]['activities'] = [];
-
-    // 上午第一个景点
-    if (dayAttractions[0]) {
-      activities.push({
-        time: '09:00',
-        name: dayAttractions[0].name,
-        lat: dayAttractions[0].lat,
-        lng: dayAttractions[0].lng,
-        type: 'attraction',
-        duration: `${dayAttractions[0].duration}小时`,
-        note: dayAttractions[0].description.slice(0, 20),
-      });
+  // 尝试获取天气
+  let weathers: any[] = [];
+  try {
+    const weatherTool = tools.find(t => t.name === 'get_weather');
+    if (weatherTool) {
+      emit({ type: 'action', tool: 'get_weather', args: { city, dates: dateStrs }, step: 2 });
+      weathers = await weatherTool.execute({ city, dates: dateStrs });
+      emit({ type: 'observation', data: weathers, step: 2 });
     }
-
-    // 上午第二个景点
-    if (dayAttractions[1]) {
-      activities.push({
-        time: '11:00',
-        name: dayAttractions[1].name,
-        lat: dayAttractions[1].lat,
-        lng: dayAttractions[1].lng,
-        type: 'attraction',
-        duration: `${dayAttractions[1].duration}小时`,
-        note: dayAttractions[1].description.slice(0, 20),
-      });
-    }
-
-    // 午餐
-    if (dayRestaurant) {
-      activities.push({
-        time: '12:30',
-        name: dayRestaurant.name,
-        lat: dayRestaurant.lat,
-        lng: dayRestaurant.lng,
-        type: 'restaurant',
-        duration: '1小时',
-        note: `${dayRestaurant.cuisine} · 人均¥${dayRestaurant.avgPrice}`,
-      });
-    }
-
-    // 下午景点
-    if (dayAttractions[2]) {
-      activities.push({
-        time: '14:00',
-        name: dayAttractions[2].name,
-        lat: dayAttractions[2].lat,
-        lng: dayAttractions[2].lng,
-        type: 'attraction',
-        duration: `${dayAttractions[2].duration}小时`,
-        note: dayAttractions[2].description.slice(0, 20),
-      });
-    }
-
-    // 晚餐
-    const dinnerRestaurant = restaurants[(d + 1) % restaurants.length];
-    if (dinnerRestaurant) {
-      activities.push({
-        time: '18:00',
-        name: dinnerRestaurant.name,
-        lat: dinnerRestaurant.lat,
-        lng: dinnerRestaurant.lng,
-        type: 'restaurant',
-        duration: '1.5小时',
-        note: `${dinnerRestaurant.cuisine} · 人均¥${dinnerRestaurant.avgPrice}`,
-      });
-    }
-
-    days.push({
-      day: d + 1,
-      date: dateStr,
-      weather,
-      activities,
-      hotel: hotels[d % hotels.length] || hotels[0],
-    });
-
-    emit({ type: 'plan_partial', data: { day: d + 1, date: dateStr, count: activities.length }, step: 4 });
+  } catch {
+    // weather tool failed, continue without it
   }
 
-  // Step 5: 最终行程
-  emit({ type: 'thought', content: '行程规划完成，正在整理输出...', step: 5 });
-
-  const estimatedHotelCost = hotels.length > 0
-    ? days.reduce((sum, d) => sum + (d.hotel?.pricePerNight || 0), 0)
-    : request.days * 500;
+  const planDays: TripPlan['days'] = [];
+  for (let d = 0; d < days; d++) {
+    planDays.push({
+      day: d + 1,
+      date: dateStrs[d],
+      weather: weathers[d] || null,
+      activities: [
+        {
+          time: '09:00',
+          name: `第${d + 1}天景点`,
+          lat: 0, lng: 0,
+          type: 'attraction',
+          duration: '3小时',
+          note: '请配置 LLM API Key 获取真实行程',
+        },
+      ],
+      hotel: null,
+    });
+    emit({ type: 'plan_partial', data: { day: d + 1, date: dateStrs[d], count: 1 }, step: 3 });
+  }
 
   const tripPlan: TripPlan = {
-    city: request.city,
-    days,
-    totalBudget: `机票约2000-3000元 + 酒店约${estimatedHotelCost}元 + 餐饮及门票约3000元 = 总计约${estimatedHotelCost + 5000}元`,
-    tips: [
-      `建议购买${request.city}公交一日券，省钱又方便`,
-      '大部分公园和博物馆免费或低价，热门景点建议提前在美团预约门票',
-      '国内靠右行驶，注意交通安全；热门景区尽量早出晚归避开人流',
-      '携带现金，有些小店不支持信用卡',
-      `根据天气情况：${days[0]?.weather?.suggestion || '注意防晒或保暖'}`,
-    ],
+    city,
+    days: planDays,
+    totalBudget: '模拟模式 — 请配置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 获取真实行程',
+    tips: ['当前为模拟模式，请设置环境变量 OPENAI_API_KEY 或 DEEPSEEK_API_KEY 启用 AI 规划'],
   };
 
-  emit({ type: 'plan_complete', plan: tripPlan, step: 5 });
+  emit({ type: 'plan_complete', plan: tripPlan, step: 4 });
   return tripPlan;
 }
 
@@ -317,7 +292,7 @@ function extractJSONBlocks(text: string): string[] {
 }
 
 // ---- 文本解析（降级使用） ----
-function parsePlanFromText(text: string, request: TripRequest): TripPlan {
+function parsePlanFromText(text: string): TripPlan {
   const candidates: string[] = [];
 
   // 策略1: 提取 ```json ... ``` 代码块中的 JSON
@@ -355,7 +330,7 @@ function parsePlanFromText(text: string, request: TripRequest): TripPlan {
       if (parsed.city && Array.isArray(parsed.days)) {
         // 补全可能缺失的字段
         return {
-          city: parsed.city || request.city,
+          city: parsed.city,
           days: (parsed.days || []).map((d: any, i: number) => ({
             day: d.day || i + 1,
             date: d.date || new Date(Date.now() + i * 86400000).toISOString().split('T')[0],
@@ -384,173 +359,25 @@ function parsePlanFromText(text: string, request: TripRequest): TripPlan {
 
   // 最终降级
   return {
-    city: request.city,
+    city: '未知城市',
     days: [],
     totalBudget: '请参考上方详细行程',
-    tips: ['建议联系旅行顾问获取更详细的信息'],
+    tips: ['未能解析出行程数据，请重新描述您的旅行需求'],
   };
 }
 
-// ---- 自由对话模式（带记忆：滑动窗口 + 历史精炼） ----
-async function runChatWithMemory(
-  userMessage: string,
-  memory: MemoryManager,
-  emit: SSECallback,
-): Promise<string> {
-  const { client, model } = createLLMClient();
-
-  emit({ type: 'start', message: '正在处理您的问题...', step: 0 });
-
-  // Step 1: 添加用户消息到记忆
-  memory.addUserMessage(userMessage);
-
-  // Step 2: 检查是否需要压缩（在构建上下文之前）
-  if (memory.needsCompression()) {
-    emit({ type: 'thought', content: '🔄 正在精炼历史对话...', step: -1 });
-    const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || '';
-    const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-    await memory.compress(apiKey, baseURL, model);
-  }
-
-  // Step 3: 构建上下文（system + summary + window messages）
-  const messages = memory.getContextMessages();
-
-  let step = 0;
-  const maxSteps = 15;
-
-  while (step < maxSteps) {
-    step++;
-
-    const completion = await client.chat.completions.create({
-      model,
-      messages,
-      tools: tools.map(t => ({
-        type: 'function' as const,
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
-        },
-      })),
-      tool_choice: 'auto',
-    });
-
-    const responseMessage = completion.choices[0].message;
-
-    if (responseMessage.content) {
-      emit({ type: 'thought', content: responseMessage.content, step });
-    }
-
-    if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-      // 对话完成
-      const finalContent = responseMessage.content || '';
-
-      // Chat 模式兜底：如果 LLM 错误地输出了 JSON，要求重试
-      const looksLikeJSON = finalContent.trim().startsWith('{') && finalContent.includes('"city"');
-      if (looksLikeJSON && step < maxSteps - 1) {
-        emit({ type: 'thought', content: '⚠️ Chat 模式不应输出 JSON，正在转换为可读格式...', step });
-        messages.push(responseMessage);
-        messages.push({
-          role: 'user',
-          content: '⚠️ MODE=chat 禁止输出 JSON。请用 markdown 格式重新输出：图片用 ![](url)、链接用 [文字](url)、评分加粗、价格原样。',
-        });
-        continue;
-      }
-
-      // 将助手回复存入记忆
-      memory.addAssistantMessage(finalContent);
-
-      // 如果回复后消息超窗，异步压缩（不阻塞当前响应）
-      if (memory.needsCompression()) {
-        const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || '';
-        const baseURL = process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-        memory.compress(apiKey, baseURL, model).catch(e =>
-          console.warn('⚠️  后台记忆压缩失败:', e),
-        );
-      }
-
-      emit({ type: 'plan_complete', plan: { city: '', days: [], totalBudget: '', tips: [] }, step });
-      return finalContent;
-    }
-
-    // 处理 tool calls
-    messages.push(responseMessage);
-
-    for (const toolCall of responseMessage.tool_calls) {
-      const toolName = toolCall.function.name;
-      const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
-
-      emit({ type: 'action', tool: toolName, args: toolArgs, step });
-
-      const tool = tools.find(t => t.name === toolName);
-      let result: any;
-
-      if (tool) {
-        try {
-          result = await tool.execute(toolArgs);
-        } catch (e: any) {
-          result = { error: e.message };
-        }
-      } else {
-        result = { error: `Unknown tool: ${toolName}` };
-      }
-
-      emit({ type: 'observation', data: result, step });
-
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(result),
-      });
-    }
-  }
-
-  throw new Error('Agent 超过最大步骤数');
-}
-
 // ---- 主入口 ----
-export async function runAgent(request: TripRequest, emit: SSECallback): Promise<TripPlan> {
-  const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
-
-  if (apiKey) {
-    return runWithLLM(request, emit);
-  }
-
-  console.log('⚠️  未设置 API Key，使用模拟模式运行');
-  return runSimulated(request, emit);
-}
-
-/**
- * 自由对话入口（带记忆）
- * @param message  用户消息
- * @param sessionId 会话 ID（同一会话保持记忆连续性）
- * @param emit     SSE 回调
- */
-export async function runChatAgent(
-  message: string,
-  sessionId: string,
-  emit: SSECallback,
-): Promise<string> {
+export async function runAgent(message: string, sessionId: string, emit: SSECallback, isAborted: () => boolean): Promise<TripPlan> {
   const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
 
   if (apiKey) {
     const memory = getSessionMemory(sessionId);
-    return runChatWithMemory(message, memory, emit);
+    return runWithLLM(message, memory, emit, isAborted);
   }
 
-  // 模拟模式下的对话：简单回显
-  emit({ type: 'start', message: '(模拟模式) 处理您的问题...', step: 0 });
-  emit({
-    type: 'thought',
-    content: `收到您的消息：${message}。当前为模拟模式，请配置 LLM API Key 以获得完整功能。`,
-    step: 1,
-  });
-  emit({ type: 'plan_complete', plan: { city: '', days: [], totalBudget: '', tips: [] }, step: 1 });
-  return '模拟模式回复';
+  console.log('⚠️  未设置 API Key，使用模拟模式运行');
+  return runSimulated(message, emit);
 }
 
 /** 清除指定 session 的记忆 */
-export function clearSessionMemory(sessionId: string): void {
-  const memory = getSessionMemory(sessionId);
-  memory.clear();
-}
+export { clearSessionMemory } from './memory.js';

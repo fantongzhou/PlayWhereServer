@@ -1,9 +1,5 @@
-import { searchAttractions } from '../services/attractions.js';
-import { searchHotels } from '../services/hotels.js';
-import { searchFlights as getFlights } from '../services/flights.js';
 import { getWeatherBatch } from '../services/weather.js';
 import { getRoute } from '../services/routes.js';
-import { searchRestaurants } from '../services/restaurants.js';
 import {
   searchMeituanTravel,
   saveToken,
@@ -20,51 +16,8 @@ export interface ToolDefinition {
 
 export const tools: ToolDefinition[] = [
   {
-    name: 'search_attractions',
-    description: '搜索指定城市的旅游景点。参数: city(城市名), preferences(偏好数组，如["文化历史","美食购物"])',
-    parameters: {
-      type: 'object',
-      properties: {
-        city: { type: 'string', description: '城市名称，如"北京"、"上海"、"三亚"' },
-        preferences: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '用户的偏好标签',
-        },
-      },
-      required: ['city'],
-    },
-    execute: async (args) => searchAttractions(args.city, args.preferences || []),
-  },
-  {
-    name: 'search_hotels',
-    description: '搜索指定城市的酒店。参数: city(城市名), budget(预算等级: budget/moderate/luxury)',
-    parameters: {
-      type: 'object',
-      properties: {
-        city: { type: 'string', description: '城市名称' },
-        budget: { type: 'string', enum: ['budget', 'moderate', 'luxury'], description: '预算等级' },
-      },
-      required: ['city'],
-    },
-    execute: async (args) => searchHotels(args.city, args.budget || 'moderate'),
-  },
-  {
-    name: 'search_flights',
-    description: '搜索航班信息。参数: origin(出发城市), destination(目的城市)',
-    parameters: {
-      type: 'object',
-      properties: {
-        origin: { type: 'string', description: '出发城市' },
-        destination: { type: 'string', description: '目的城市' },
-      },
-      required: ['origin', 'destination'],
-    },
-    execute: async (args) => getFlights(args.origin, args.destination),
-  },
-  {
     name: 'get_weather',
-    description: '获取指定城市一个或多个日期的天气。参数: city(城市名), dates(日期数组，格式YYYY-MM-DD，如["2026-06-20","2026-06-21"])。返回天气信息数组。',
+    description: '获取指定城市一个或多个日期的天气（高德 API）。参数: city(中文城市名即可，也支持高德 adcode), dates(日期数组，格式YYYY-MM-DD，如["2026-06-20","2026-06-21"])。返回天气信息数组，含 condition/temperature/suggestion。',
     parameters: {
       type: 'object',
       properties: {
@@ -104,24 +57,6 @@ export const tools: ToolDefinition[] = [
     },
     execute: async (args) => getRoute(args.fromName, args.fromLat, args.fromLng, args.toName, args.toLat, args.toLng),
   },
-  {
-    name: 'search_restaurants',
-    description: '搜索指定城市的餐厅。参数: city(城市名), preferences(偏好数组)',
-    parameters: {
-      type: 'object',
-      properties: {
-        city: { type: 'string', description: '城市名称' },
-        preferences: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '菜系偏好',
-        },
-      },
-      required: ['city'],
-    },
-    execute: async (args) => searchRestaurants(args.city, args.preferences || []),
-  },
-
   // ============================================================
   // 美团旅行 Skill 工具
   // ============================================================

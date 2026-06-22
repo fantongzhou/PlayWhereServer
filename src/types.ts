@@ -65,6 +65,7 @@ export interface Restaurant {
 export type SSEEventType =
   | 'start'
   | 'thought'
+  | 'response'
   | 'action'
   | 'observation'
   | 'plan_partial'
