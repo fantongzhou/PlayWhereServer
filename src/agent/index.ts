@@ -111,7 +111,8 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
 
       if (isPlainTextQuestion) {
         memory.addAssistantMessage(finalContent);
-        emit({ type: 'response', content: finalContent, step });
+        // 追问是纯自然语言，直接发送
+        emit({ type: 'response', content: finalContent.trim(), step });
         const questionPlan: TripPlan = {
           city: '', days: [], totalBudget: '', tips: [finalContent.trim()],
         };
@@ -128,7 +129,9 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
       }
 
       memory.addAssistantMessage(finalContent);
-      emit({ type: 'response', content: finalContent, step });
+      // response 只发自然语言部分，去掉 JSON 代码块
+      const naturalContent = finalContent.replace(/```json[\s\S]*?```/g, '').replace(/\{[\s\S]*"city"[\s\S]*"days"[\s\S]*\}/g, '').trim();
+      emit({ type: 'response', content: naturalContent || '已为您生成行程，请查看右侧面板 👉', step });
       emit({ type: 'plan_complete', plan: tripPlan, step });
       return tripPlan;
     }
