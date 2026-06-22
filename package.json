@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "setup": "bash scripts/setup-flyai.sh",
+    "dev": "bash scripts/setup-flyai.sh && tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "bash scripts/setup-flyai.sh && node dist/index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

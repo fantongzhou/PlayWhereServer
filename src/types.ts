@@ -92,9 +92,9 @@ export interface Activity {
   type: 'attraction' | 'restaurant' | 'hotel';
   duration: string;
   note: string;
-  /** 购票/预订链接（美团返回） */
+  /** 购票/预订链接（飞猪返回） */
   bookingUrl?: string;
-  /** 景点图片（美团返回） */
+  /** 景点图片（飞猪返回） */
   imageUrls?: string[];
 }
 
