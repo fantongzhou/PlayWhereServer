@@ -24,13 +24,8 @@ function createLLMClient(): { client: OpenAI; model: string } {
 
 // ---- LLM 模式 ----
 async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallback, isAborted: () => boolean): Promise<TripPlan> {
-  let res: any;
-  try {
-    res = createLLMClient();
-  } catch (err) {
-    console.log(err);
-  }
-  const { client, model } = res;
+  
+  const { client, model } = createLLMClient();
 
   if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
 
