@@ -18,7 +18,7 @@ function createLLMClient(): { client: OpenAI; model: string } {
 
   return {
     client: new OpenAI({ apiKey, baseURL }),
-    model: process.env.LLM_MODEL || 'deepseek-chat',
+    model: process.env.LLM_MODEL || 'deepseek-v4',
   };
 }
 
