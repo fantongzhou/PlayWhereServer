@@ -48,7 +48,7 @@ router.post('/', async (req: Request, res: Response) => {
 
   // 首次请求时告知客户端 sessionId
   if (!sessionId) {
-    sendSSE({ type: 'start', message: '正在为您定制旅行计划...', step: 0, data: { sessionId: sid } });
+    sendSSE({ type: 'start', step: 0, data: { sessionId: sid } });
   }
 
   try {

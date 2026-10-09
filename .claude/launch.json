@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cot-demo",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--yes", "serve", "demo"],
+      "port": 3334,
+      "autoPort": true
+    }
+  ]
+}

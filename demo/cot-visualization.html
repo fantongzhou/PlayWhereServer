@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent Trace · 思维链可视化</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+/* ============================================================
+   设计语言：机场出发信息屏（Departure Board）
+   —— 深蓝夜幕底色 + 琥珀黄主色，Agent 每一步像一块翻牌
+   thought=琥珀 / action=青 / observation=绿 / error=红
+   ============================================================ */
+:root {
+  --bg: #0B0E16;          /* 夜幕蓝黑 */
+  --panel: #121726;       /* 面板 */
+  --panel-2: #161C2E;     /* 面板内嵌 */
+  --line: #232B44;        /* 分隔线 */
+  --text: #DCE3F2;        /* 主文字 */
+  --dim: #7C86A3;         /* 次要文字 */
+  --amber: #FFB627;       /* 琥珀：思考 */
+  --cyan: #5FD4E8;        /* 青：工具调用 */
+  --green: #6FE0A8;       /* 绿：观察结果 */
+  --red: #FF6B6B;         /* 红：错误 */
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { color-scheme: dark; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.7;
+  min-height: 100vh;
+  /* 信息屏的横向扫描线质感 */
+  background-image: repeating-linear-gradient(
+    0deg, transparent 0 2px, rgba(255, 255, 255, 0.012) 2px 4px);
+}
+
+::selection { background: rgba(255, 182, 39, 0.3); }
+
+button {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: border-color .15s, color .15s;
+}
+button:hover { border-color: var(--amber); color: var(--amber); }
+button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+button.primary { border-color: var(--amber); color: var(--amber); }
+button.primary:hover { background: rgba(255, 182, 39, 0.1); }
+
+input[type="text"] {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 7px 10px;
+  width: 100%;
+}
+input[type="text"]:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+input[type="text"]::placeholder { color: var(--dim); opacity: .6; }
+
+/* ---------- 顶栏：出发信息屏的标题带 ---------- */
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 20px;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255, 182, 39, 0.04), transparent 70%);
+}
+
+.brand { display: flex; align-items: baseline; gap: 12px; }
+.brand h1 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  color: var(--amber);
+  text-transform: uppercase;
+}
+.brand small { font-size: 12px; color: var(--dim); letter-spacing: 0.12em; }
+
+/* 状态牌：内容变化时 JS 做翻牌乱码动画 */
+.board {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  letter-spacing: 0.18em;
+}
+.board .lamp {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--dim);
+  box-shadow: 0 0 0 0 transparent;
+}
+.board.running  .lamp { background: var(--amber); animation: pulse 1.2s ease-in-out infinite; }
+.board.done     .lamp { background: var(--green); }
+.board.error    .lamp { background: var(--red); }
+.board .label { color: var(--dim); }
+.board .state { color: var(--text); min-width: 8ch; } /* 防翻牌时跳动 */
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 2px 0 var(--amber); }
+  50%      { box-shadow: 0 0 10px 1px var(--amber); }
+}
+
+/* ---------- 控制区 ---------- */
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--line);
+  align-items: center;
+}
+.controls .field { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 280px; }
+.controls .field label { font-size: 11px; letter-spacing: 0.15em; color: var(--dim); white-space: nowrap; }
+.controls .speed { display: flex; gap: 0; }
+.controls .speed button { border-right-width: 0; }
+.controls .speed button:last-child { border-right-width: 1px; }
+.controls .speed button[aria-pressed="true"] {
+  background: rgba(255, 182, 39, 0.12);
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+/* ---------- 主体：左时间线 + 右航显摘要 ---------- */
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 0;
+  max-width: 1280px;
+  margin: 0 auto;
+  min-height: calc(100vh - 130px);
+}
+
+/* ---------- 时间线 ---------- */
+#timeline {
+  padding: 24px 28px 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.evt {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--c, var(--dim));
+  background: var(--panel);
+  animation: rise .3s ease both;
+}
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+.evt-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--dim);
+  border-bottom: 1px solid var(--line);
+  text-transform: uppercase;
+}
+.evt-head .tag { color: var(--c); font-weight: 600; }
+.evt-head .stepno { color: var(--dim); }
+.evt-head .t { margin-left: auto; letter-spacing: 0.05em; }
+
+.evt-body { padding: 12px 14px; font-size: 13px; }
+
+/* 思考块 */
+.evt.thought { --c: var(--amber); }
+.evt.thought .evt-body { color: #EAD9B0; white-space: pre-wrap; word-break: break-word; }
+
+/* 打字光标 */
+.caret {
+  display: inline-block;
+  width: 8px; height: 1.1em;
+  background: var(--amber);
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  animation: blink 0.9s steps(1) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+/* 工具调用块 */
+.evt.action { --c: var(--cyan); }
+.tool-call {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+}
+.tool-call .fname { color: var(--cyan); font-weight: 600; }
+.tool-call .arrow { color: var(--dim); }
+.tool-call pre {
+  flex-basis: 100%;
+  color: #A9C6CE;
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+/* 观察结果块（可折叠） */
+.evt.observation { --c: var(--green); }
+.evt.observation > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+.evt.observation > summary::-webkit-details-marker { display: none; }
+.evt.observation > summary .chev { transition: transform .15s; display: inline-block; }
+.evt.observation[open] > summary .chev { transform: rotate(90deg); }
+.evt.observation pre {
+  color: #9FBFA9;
+  font-size: 12px;
+  overflow-x: auto;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+/* 系统状态行 */
+.evt.status { --c: var(--dim); background: transparent; border-style: dashed; }
+.evt.status .evt-body { color: var(--dim); }
+
+/* 错误块 */
+.evt.error { --c: var(--red); }
+.evt.error .evt-body { color: #F0B9B9; }
+
+/* ---------- 最终回答：行程单（登机牌） ---------- */
+.ticket {
+  --c: var(--amber);
+  position: relative;
+  border: 1px solid rgba(255, 182, 39, 0.45);
+  background: linear-gradient(160deg, rgba(255, 182, 39, 0.07), transparent 55%), var(--panel);
+  animation: rise .3s ease both;
+}
+.ticket .evt-body { padding-top: 14px; }
+.ticket .tear {
+  position: relative;
+  margin: 14px -14px 0;
+  border-top: 1px dashed rgba(255, 182, 39, 0.5);
+}
+/* 票据缺口 */
+.ticket .tear::before, .ticket .tear::after {
+  content: "";
+  position: absolute;
+  top: -6px;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 1px solid rgba(255, 182, 39, 0.45);
+}
+.ticket .tear::before { left: -7px; border-left-color: transparent; }
+.ticket .tear::after  { right: -7px; border-right-color: transparent; }
+.ticket .prose { white-space: pre-wrap; color: var(--text); }
+.ticket .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  padding: 10px 2px 2px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+.ticket .meta b { color: var(--amber); font-weight: 600; }
+
+/* ---------- 右侧：航显摘要面板 ---------- */
+aside {
+  border-left: 1px solid var(--line);
+  padding: 24px 20px 40px;
+  font-size: 12px;
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: 100vh;
+  overflow-y: auto;
+}
+aside h2 {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 14px;
+}
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); }
+.stat { background: var(--panel); padding: 10px 12px; }
+.stat .k { font-size: 10px; letter-spacing: 0.15em; color: var(--dim); text-transform: uppercase; }
+.stat .v { font-size: 20px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+
+.tools-list { margin-top: 20px; }
+.tools-list ul { list-style: none; }
+.tools-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  color: #A9B4CC;
+}
+.tools-list li .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); flex: none; }
+.tools-list li.done .dot { background: var(--green); }
+.tools-list li.done { color: var(--text); }
+.tools-list li .cnt { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+.legend { margin-top: 20px; display: grid; gap: 6px; }
+.legend .row { display: flex; align-items: center; gap: 8px; color: var(--dim); }
+.legend .sw { width: 10px; height: 10px; flex: none; border: 1px solid var(--c); background: color-mix(in srgb, var(--c) 25%, transparent); }
+
+.hint { margin-top: 22px; color: var(--dim); line-height: 1.8; font-size: 11px; }
+.hint code { color: #A9B4CC; }
+
+/* 空态 */
+.empty { color: var(--dim); text-align: center; padding: 60px 20px; border: 1px dashed var(--line); }
+.empty .big { font-size: 15px; color: #A9B4CC; margin-bottom: 8px; letter-spacing: 0.1em; }
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 960px) {
+  main { grid-template-columns: 1fr; }
+  aside { position: static; max-height: none; border-left: 0; border-top: 1px solid var(--line); order: 2; }
+  #timeline { order: 1; padding: 18px 16px 60px; }
+  .stats { grid-template-columns: repeat(4, 1fr); }
+}
+
+/* ---------- 减少动态 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .evt, .ticket { animation: none; }
+  .caret { animation: none; }
+  .board.running .lamp { animation: none; }
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>Agent&nbsp;Trace</h1>
+    <small>思维链可视化 · ReACT LOOP</small>
+  </div>
+  <div class="board" id="board">
+    <span class="lamp"></span>
+    <span class="label">STATUS</span>
+    <span class="state" id="boardState">STANDBY</span>
+  </div>
+</header>
+
+<div class="controls">
+  <button id="btnReplay" class="primary">▶ 重放示例</button>
+  <div class="field">
+    <label for="msgInput">提问</label>
+    <input type="text" id="msgInput" value="帮我规划北京周末两日游，预算中等，喜欢历史和美食" />
+  </div>
+  <button id="btnLive">⚡ 连接真实服务</button>
+  <div class="speed" role="group" aria-label="回放速度">
+    <button data-speed="1" aria-pressed="true">1×</button>
+    <button data-speed="4" aria-pressed="false">4×</button>
+  </div>
+  <button id="btnStop" disabled>■ 停止</button>
+</div>
+
+<main>
+  <section id="timeline" aria-live="polite">
+    <div class="empty" id="empty">
+      <div class="big">TRACE EMPTY · 等待输入</div>
+      点击「重放示例」观看一段模拟的思维链，<br />
+      或启动 server 后点击「连接真实服务」实时观测 Agent 推理。
+    </div>
+  </section>
+
+  <aside>
+    <h2>Flight Summary</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">Steps</div><div class="v" id="stSteps">0</div></div>
+      <div class="stat"><div class="k">Tool Calls</div><div class="v" id="stTools">0</div></div>
+      <div class="stat"><div class="k">Chars</div><div class="v" id="stChars">0</div></div>
+      <div class="stat"><div class="k">Elapsed</div><div class="v" id="stTime">0:00</div></div>
+    </div>
+
+    <div class="tools-list">
+      <h2>Tools Called</h2>
+      <ul id="toolList"></ul>
+    </div>
+
+    <div class="legend">
+      <h2>Legend</h2>
+      <div class="row" style="--c: var(--amber)"><span class="sw"></span>Thought · 模型推理</div>
+      <div class="row" style="--c: var(--cyan)"><span class="sw"></span>Action · 工具调用</div>
+      <div class="row" style="--c: var(--green)"><span class="sw"></span>Observation · 返回结果</div>
+      <div class="row" style="--c: var(--amber)"><span class="sw"></span>Response · 最终回答</div>
+    </div>
+
+    <p class="hint">
+      实时模式连接 <code>POST /api/plan</code>（SSE 流）。<br />
+      先启动服务：<code>npm run dev</code>，默认地址 <code>http://localhost:3334</code>。
+    </p>
+  </aside>
+</main>
+
+<script>
+/* ============================================================
+   渲染层：把一条 SSE 事件渲染成时间线上的一块
+   ============================================================ */
+const timelineEl = document.getElementById('timeline');
+const emptyEl = document.getElementById('empty');
+const boardEl = document.getElementById('board');
+const boardStateEl = document.getElementById('boardState');
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const stats = {
+  steps: 0, tools: 0, chars: 0,
+  t0: null, timer: null,
+  toolCounts: new Map(),
+};
+
+function bumpStat(id, val) {
+  document.getElementById(id).textContent = val;
+}
+
+function startClock() {
+  stats.t0 = Date.now();
+  clearInterval(stats.timer);
+  stats.timer = setInterval(() => {
+    const s = Math.floor((Date.now() - stats.t0) / 1000);
+    bumpStat('stTime', `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`);
+  }, 500);
+}
+function stopClock() { clearInterval(stats.timer); }
+
+function clearTrace() {
+  timelineEl.innerHTML = '';
+  emptyEl?.remove();
+  stats.steps = 0; stats.tools = 0; stats.chars = 0;
+  stats.toolCounts.clear();
+  document.getElementById('toolList').innerHTML = '';
+  bumpStat('stSteps', 0); bumpStat('stTools', 0); bumpStat('stChars', 0); bumpStat('stTime', '0:00');
+}
+
+/* 出发信息屏状态：文字翻牌（乱码滚动到目标字） */
+function setBoard(state, cls) {
+  boardEl.className = 'board ' + cls;
+  scramble(boardStateEl, state);
+}
+
+function scramble(el, finalText) {
+  if (reducedMotion) { el.textContent = finalText; return; }
+  const glyphs = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789·';
+  let frame = 0;
+  const total = 12;
+  clearInterval(el._scramble);
+  el._scramble = setInterval(() => {
+    frame++;
+    el.textContent = finalText.split('').map((ch, i) => {
+      if (ch === ' ') return ' ';
+      // 逐位从左到右"翻"定
+      return i < (frame / total) * finalText.length ? ch
+        : glyphs[Math.random() * glyphs.length | 0];
+    }).join('');
+    if (frame >= total) { clearInterval(el._scramble); el.textContent = finalText; }
+  }, 40);
+}
+
+/* 用户是否手动上滚了 —— 上滚时不自动跟随 */
+function autoScroll() {
+  const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+  if (nearBottom) window.scrollTo({ top: document.body.scrollHeight });
+}
+
+function fmtJSON(obj) {
+  try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+}
+
+function nowTime() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+}
+
+function markStep(step) {
+  if (step > stats.steps) { stats.steps = step; bumpStat('stSteps', step); }
+}
+
+/* ---- 各事件类型的块 ---- */
+
+function openThought(step) {
+  const el = document.createElement('div');
+  el.className = 'evt thought';
+  el.innerHTML = `
+    <div class="evt-head">
+      <span class="stepno">STEP ${String(step).padStart(2, '0')}</span>
+      <span class="tag">Thought</span>
+      <span class="t">${nowTime()}</span>
+    </div>
+    <div class="evt-body"><span class="text"></span><span class="caret"></span></div>`;
+  timelineEl.appendChild(el);
+  autoScroll();
+  return el.querySelector('.text');
+}
+
+function closeThought() {
+  timelineEl.querySelector('.evt.thought:last-of-type .caret')?.remove();
+}
+
+function addAction(step, tool, args) {
+  markStep(step);
+  const el = document.createElement('div');
+  el.className = 'evt action';
+  el.innerHTML = `
+    <div class="evt-head">
+      <span class="stepno">STEP ${String(step).padStart(2, '0')}</span>
+      <span class="tag">Action</span>
+      <span class="t">${nowTime()}</span>
+    </div>
+    <div class="evt-body">
+      <div class="tool-call">
+        <span class="fname">${tool}</span>
+        <span class="arrow">←</span>
+        <span style="color:var(--dim)">调用参数</span>
+        <pre>${escapeHTML(fmtJSON(args))}</pre>
+      </div>
+    </div>`;
+  timelineEl.appendChild(el);
+  stats.tools++;
+  bumpStat('stTools', stats.tools);
+  trackTool(tool);
+  autoScroll();
+}
+
+function trackTool(name) {
+  stats.toolCounts.set(name, (stats.toolCounts.get(name) || 0) + 1);
+  const list = document.getElementById('toolList');
+  const li = list.querySelector(`[data-tool="${CSS.escape(name)}"]`);
+  if (li) {
+    li.classList.add('done');
+    li.querySelector('.cnt').textContent = '×' + stats.toolCounts.get(name);
+  } else {
+    const nli = document.createElement('li');
+    nli.dataset.tool = name;
+    nli.className = 'done';
+    nli.innerHTML = `<span class="dot"></span>${escapeHTML(name)}<span class="cnt">×1</span>`;
+    list.appendChild(nli);
+  }
+}
+
+function addObservation(step, data) {
+  markStep(step);
+  const el = document.createElement('details');
+  el.className = 'evt observation';
+  el.innerHTML = `
+    <summary class="evt-head">
+      <span class="stepno">STEP ${String(step).padStart(2, '0')}</span>
+      <span class="tag">Observation</span>
+      <span class="chev">▸</span>
+      <span class="t">${nowTime()}</span>
+    </summary>
+    <div class="evt-body"><pre>${escapeHTML(fmtJSON(data))}</pre></div>`;
+  timelineEl.appendChild(el);
+  autoScroll();
+}
+
+function addStatus(step, content) {
+  const el = document.createElement('div');
+  el.className = 'evt status';
+  el.innerHTML = `
+    <div class="evt-head">
+      <span class="stepno">SYS</span>
+      <span class="tag">Status</span>
+      <span class="t">${nowTime()}</span>
+    </div>
+    <div class="evt-body">${escapeHTML(content)}</div>`;
+  timelineEl.appendChild(el);
+  autoScroll();
+}
+
+function addError(msg) {
+  const el = document.createElement('div');
+  el.className = 'evt error';
+  el.innerHTML = `
+    <div class="evt-head"><span class="tag">Error</span><span class="t">${nowTime()}</span></div>
+    <div class="evt-body">${escapeHTML(msg)}</div>`;
+  timelineEl.appendChild(el);
+  autoScroll();
+}
+
+/* 最终回答 —— 行程单样式 */
+function addResponse(step, content, meta) {
+  markStep(step);
+  const el = document.createElement('div');
+  el.className = 'ticket evt';
+  const metaHTML = meta ? Object.entries(meta).map(([k, v]) =>
+    `<span>${escapeHTML(k)} <b>${escapeHTML(String(v))}</b></span>`).join('') : '';
+  el.innerHTML = `
+    <div class="evt-head">
+      <span class="stepno">FINAL</span>
+      <span class="tag">Response · 行程单</span>
+      <span class="t">${nowTime()}</span>
+    </div>
+    <div class="evt-body">
+      <div class="prose">${escapeHTML(content)}</div>
+      <div class="tear"></div>
+      <div class="meta">${metaHTML}</div>
+    </div>`;
+  timelineEl.appendChild(el);
+  autoScroll();
+}
+
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ---- 思考打字机 ---- */
+async function typeText(el, text, token) {
+  stats.chars += text.length;
+  bumpStat('stChars', stats.chars);
+  if (reducedMotion) { el.textContent += text; autoScroll(); return; }
+  // 按小段吐字，模拟 token 流
+  for (let i = 0; i < text.length; i += 2) {
+    if (token.aborted) return;
+    el.textContent += text.slice(i, i + 2);
+    if (i % 24 === 0) autoScroll();
+    await sleep(18 / speed);
+  }
+  autoScroll();
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+let speed = 1;
+
+/* ============================================================
+   运行控制
+   ============================================================ */
+let runToken = null; // { aborted } — 控制当前回放/实时流
+
+function beginRun() {
+  if (runToken) runToken.aborted = true;
+  runToken = { aborted: false };
+  clearTrace();
+  setBoard('RUNNING', 'running');
+  startClock();
+  document.getElementById('btnStop').disabled = false;
+  return runToken;
+}
+
+function endRun(cls) {
+  stopClock();
+  document.getElementById('btnStop').disabled = true;
+  if (cls === 'error') setBoard('ERROR', 'error');
+  else setBoard('ARRIVED', 'done');
+}
+
+/* ============================================================
+   模式一：内置示例回放（无需后端）
+   一个完整的 ReAct 循环：思考 → 查天气 → 思考 → 查路线
+   → 思考 → 美团搜酒店 → 生成行程
+   ============================================================ */
+const MOCK_SCRIPT = [
+  { type: 'start', step: 0 },
+  { type: 'thought', step: 1, text: '用户想要北京周末两日游，预算中等，喜欢历史和美食。我需要：1) 先查周末两天的天气来决定户外/室内安排；2) 规划景点动线；3) 找一家位置合适、预算内的酒店。先查天气。' },
+  { type: 'action', step: 2, tool: 'get_weather', args: { city: '北京', dates: ['2026-09-19', '2026-09-20'] } },
+  { type: 'observation', step: 2, data: [
+      { date: '2026-09-19', condition: '晴', temperature: { low: 16, high: 28 }, suggestion: '适合户外活动，注意防晒' },
+      { date: '2026-09-20', condition: '多云', temperature: { low: 15, high: 24 }, suggestion: '舒适，适合游览' },
+  ]},
+  { type: 'thought', step: 3, text: '周六晴天 → 户外优先：上午故宫（需提前预约），下午景山公园看故宫全景。周日多云 → 国家博物馆（室内）+ 前门大栅栏觅食。先确认故宫到景山的交通。' },
+  { type: 'action', step: 4, tool: 'get_route', args: { fromName: '故宫博物院', fromLat: 39.9163, fromLng: 116.3972, toName: '景山公园', toLat: 39.9286, toLng: 116.3958 } },
+  { type: 'observation', step: 4, data: { from: '故宫博物院', to: '景山公园', modes: [{ type: '步行', duration: 18, price: 0 }, { type: '打车', duration: 8, price: 15 }], distance: 1.4 } },
+  { type: 'thought', step: 5, text: '步行 18 分钟可达，动线成立。接下来用美团搜酒店：故宫/王府井一带，中等预算 400-600 元，方便两天的行程。这个调用需要 1-2 分钟。' },
+  { type: 'action', step: 6, tool: 'search_meituan_travel', args: { city: '北京', query: '9月19日入住一晚，故宫王府井附近，双人大床房，预算400-600元，出行方便' } },
+  { type: 'observation', step: 6, data: { results: [
+      { name: '王府井希尔顿酒店', price: 588, rating: 4.7, distance: '距故宫1.2km', bookingUrl: 'https://www.meituan.com/xxx' },
+      { name: '北京翠明庄宾馆', price: 429, rating: 4.5, distance: '距故宫0.8km', bookingUrl: 'https://www.meituan.com/yyy' },
+  ], note: '数据来自美团旅行平台' } },
+  { type: 'thought', step: 7, text: '信息齐了：天气 ✔ 动线 ✔ 酒店 ✔（翠明庄性价比更高且更近）。现在组装最终行程 JSON 并输出。' },
+  { type: 'response', step: 8, text: '您的北京两日游行程已生成：\n\nDay 1（周六·晴 16-28°C）\n  09:00 故宫博物院（提前预约，约4小时）\n  14:00 景山公园登高看紫禁城全景（步行18分钟）\n  17:30 南锣鼓巷晚餐\n  宿：北京翠明庄宾馆 ¥429\n\nDay 2（周日·多云 15-24°C）\n  09:00 国家博物馆（需预约）\n  13:30 前门大栅栏午餐 + 逛吃\n  16:00 返程\n\n预算合计约 ¥1100/人（含住宿、门票、餐饮）。', meta: { CITY: '北京', DAYS: 2, BUDGET: '≈¥1100/人' } },
+  { type: 'complete', step: 8 },
+];
+
+async function replayMock() {
+  const token = beginRun();
+  let thoughtEl = null;
+
+  for (const ev of MOCK_SCRIPT) {
+    if (token.aborted) return endRun();
+
+    switch (ev.type) {
+      case 'start':
+        addStatus(ev.step, '正在为您定制旅行计划 …');
+        await sleep(500 / speed);
+        break;
+      case 'thought':
+        closeThought();
+        thoughtEl = openThought(ev.step);
+        markStep(ev.step);
+        await typeText(thoughtEl, ev.text, token);
+        await sleep(400 / speed);
+        break;
+      case 'action':
+        closeThought();
+        addAction(ev.step, ev.tool, ev.args);
+        await sleep(900 / speed);
+        break;
+      case 'observation':
+        addObservation(ev.step, ev.data);
+        await sleep(700 / speed);
+        break;
+      case 'response':
+        addResponse(ev.step, ev.text, ev.meta);
+        await sleep(400 / speed);
+        break;
+      case 'complete':
+        endRun();
+        return;
+    }
+  }
+}
+
+/* ============================================================
+   模式二：连接真实服务
+   POST {server}/api/plan → SSE 流（data: {...}\n\n）
+   事件类型: start/thought/status/action/observation/response/complete/error
+   ============================================================ */
+async function runLive() {
+  const token = beginRun();
+  const message = document.getElementById('msgInput').value.trim();
+  if (!message) { addError('请输入旅行需求'); endRun('error'); return; }
+
+  const base = (localStorage.getItem('traceServer') || 'http://localhost:3334').replace(/\/+$/, '');
+  const sessionId = `trace_${Date.now()}`;
+
+  let thoughtEl = null;
+  let currentStep = 0;
+
+  const handle = async (ev) => {
+    const step = ev.step ?? ++currentStep;
+    switch (ev.type) {
+      case 'start':
+        addStatus(0, ev.message || '规划开始');
+        break;
+      case 'thought':
+        if (!thoughtEl) { thoughtEl = openThought(step); markStep(step); }
+        await typeText(thoughtEl, ev.content || '', token);
+        break;
+      case 'status':
+        closeThought(); thoughtEl = null;
+        addStatus(step, ev.content || '');
+        break;
+      case 'action':
+        closeThought(); thoughtEl = null;
+        addAction(step, ev.tool, ev.args || {});
+        break;
+      case 'observation':
+        addObservation(step, ev.data);
+        break;
+      case 'response':
+        closeThought(); thoughtEl = null;
+        addResponse(step, ev.content || '', null);
+        break;
+      case 'complete':
+        closeThought(); thoughtEl = null;
+        setBoard('ARRIVED', 'done');
+        break;
+      case 'error':
+        addError(ev.message || '未知错误');
+        setBoard('ERROR', 'error');
+        break;
+    }
+  };
+
+  try {
+    const res = await fetch(base + '/api/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, sessionId }),
+    });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    // 按 SSE 帧解析（以空行分隔）
+    while (true) {
+      if (token.aborted) { reader.cancel(); return endRun(); }
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          try { await handle(JSON.parse(line.slice(5).trim())); }
+          catch (e) { console.warn('事件解析失败', e); }
+        }
+      }
+    }
+    endRun();
+  } catch (e) {
+    if (token.aborted) { endRun(); return; }
+    addError(`连接失败：${e.message}。请确认已运行 npm run dev（${base}）。`);
+    endRun('error');
+  }
+}
+
+/* ============================================================
+   绑定控件
+   ============================================================ */
+document.getElementById('btnReplay').addEventListener('click', replayMock);
+document.getElementById('btnLive').addEventListener('click', runLive);
+document.getElementById('btnStop').addEventListener('click', () => {
+  if (runToken) runToken.aborted = true;
+  endRun();
+  addStatus(0, '■ 已中断');
+});
+document.querySelectorAll('.speed button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    speed = Number(btn.dataset.speed);
+    document.querySelectorAll('.speed button').forEach(b =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+  });
+});
+</script>
+</body>
+</html>

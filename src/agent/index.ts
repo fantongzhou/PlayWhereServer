@@ -29,7 +29,8 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
 
   if (isAborted()) throw Object.assign(new Error('用户中断'), { name: 'AbortError' });
 
-  emit({ type: 'start', message: '正在为您定制旅行计划...', step: 0 });
+  // start 事件只做会话启动信号，不带 message —— 首 token 等待期由前端三点动画呈现
+  emit({ type: 'start', step: 0 });
 
   // 将用户消息加入记忆
   memory.addUserMessage(message);
@@ -103,27 +104,27 @@ async function runWithLLM(message: string, memory: MemoryManager, emit: SSECallb
     if (!hasToolCalls) {
       // 最终答案 — 解析 JSON
       const finalContent = contentAcc;
-      const tripPlan = parsePlanFromText(finalContent);
 
-      // 检测是否是自然语言追问
-      const isPlainTextQuestion = !finalContent.trim().startsWith('{')
-        && finalContent.length < 500
-        && /[？?]|请问|什么|哪个|几天|哪座|何时/.test(finalContent);
-
-      if (isPlainTextQuestion) {
+      // 自然语言回复（闲聊/知识问答/追问）→ 放行为普通对话，不强制重试 ——
+      // 判据：文本中无行程 JSON 特征键（与 parsePlanFromText 筛候选块的签名一致），
+      // 说明模型根本没在尝试结构化输出；含特征键但解析失败才值得重试。
+      // 注意不能用 startswith('{') 判断 —— 会漏掉 ```json 围栏输出的情况。
+      const hasPlanSignature = finalContent.includes('"city"') && finalContent.includes('"days"');
+      if (!hasPlanSignature) {
+        const reply = finalContent.trim() || '本轮生成未能完成，请重试或换个说法～';
         memory.addAssistantMessage(finalContent);
-        // 追问是纯自然语言，直接发送
-        emit({ type: 'response', content: finalContent.trim(), step });
+        emit({ type: 'response', content: reply, step });
         const questionPlan: TripPlan = {
-          city: '', days: [], totalBudget: '', tips: [finalContent.trim()],
+          city: '', days: [], totalBudget: '', tips: [reply],
         };
         emit({ type: 'complete', plan: questionPlan, step });
         return questionPlan;
       }
 
-      // 空行程且未重试 → 要求 LLM 重新输出
+      const tripPlan = parsePlanFromText(finalContent);
+
+      // 疑似行程输出但解析失败且未重试 → 静默重试（内部修复动作，不发误导性 status）
       if (tripPlan.days.length === 0 && step < maxSteps - 1) {
-        emit({ type: 'status', content: '⚠️ 未检测到有效的行程 JSON，正在重新生成...', step });
         messages.push({ role: 'assistant', content: finalContent });
         messages.push({ role: 'user', content: RETRY_HINT });
         continue;
